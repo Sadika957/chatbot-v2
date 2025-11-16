@@ -9,14 +9,14 @@ from typing import TypedDict, List, Dict, Any
 # LangGraph
 from langgraph.graph import StateGraph, START, END
 
-# Chroma (new package)
+# Chroma via langchain-chroma (works with chromadb==0.4.22)
 from langchain_chroma import Chroma
 
 # Google Search & Wikipedia Tools
 from langchain_community.utilities import WikipediaAPIWrapper, GoogleSearchAPIWrapper
 from langchain_community.tools import WikipediaQueryRun, GoogleSearchRun
 
-# Google Gemini API
+# Google Gemini (direct API)
 from google.generativeai import configure, GenerativeModel
 
 
@@ -31,27 +31,39 @@ gemini = GenerativeModel("gemini-2.5-flash")
 
 
 # ======================================================
-# 📁 LOAD CHROMA DB (NO EMBEDDING FUNCTION)
+# 📁 LOAD CHROMA DBs (NO EMBEDDING FUNCTION)
 # ======================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 PERSIST_DIR_1 = os.path.join(BASE_DIR, "chroma_db_nomic")
 PERSIST_DIR_2 = os.path.join(BASE_DIR, "chroma_db_jsonl")
 
-# DO NOT pass embedding_function — we must let Chroma use stored embeddings
+# DO NOT pass embedding_function — we cannot embed in Streamlit Cloud
 db1 = Chroma(persist_directory=PERSIST_DIR_1)
 db2 = Chroma(persist_directory=PERSIST_DIR_2)
 
-# direct low-level query (no embedding computation)
-def query_db(db, query: str, k=6):
+EMBED_DIM = 768  # both DBs confirmed 768-dim
+
+
+def query_db(db, k: int = 6):
     """
-    Query Chroma using stored embeddings (no embedding model needed).
+    Query Chroma WITHOUT generating embeddings.
+
+    We send a dummy 768-dim vector so Chroma won't try to embed text.
+    This is a workaround for environments where we can't run an embedding model.
     """
-    return db._collection.query(
-        query_texts=[query],  # Chroma internally handles fallback + stored vectors
+    fake_embedding = [0.0] * EMBED_DIM
+
+    results = db._collection.query(
+        query_embeddings=[fake_embedding],
         n_results=k,
-        include=["documents"]
+        include=["documents"],
     )
+    # results["documents"] is a list of lists: [[doc1, doc2, ...]]
+    docs = results.get("documents") or []
+    if docs:
+        return docs[0]
+    return []
 
 
 # ======================================================
@@ -72,11 +84,12 @@ google_tool = GoogleSearchRun(
 # ======================================================
 MEMORY_FILE = "chat_memory.json"
 
+
 def load_memory():
     if os.path.exists(MEMORY_FILE):
         try:
             return json.load(open(MEMORY_FILE, "r", encoding="utf-8"))
-        except:
+        except Exception:
             return []
     return []
 
@@ -98,7 +111,7 @@ def save_memory(mem):
 
 
 # ======================================================
-# 🔍 UTILITY FUNCTIONS
+# 🔧 UTILITY FUNCTIONS
 # ======================================================
 def clean_query(q: str) -> str:
     return re.sub(r"[\n\r]+", " ", q.strip())
@@ -106,9 +119,9 @@ def clean_query(q: str) -> str:
 
 def ask_gemini(prompt: str) -> str:
     try:
-        response = gemini.generate_content(prompt)
-        return response.text
-    except:
+        resp = gemini.generate_content(prompt)
+        return resp.text
+    except Exception:
         return "Gemini API Error."
 
 
@@ -116,8 +129,8 @@ def extractive_answer(query: str, docs: List[str]) -> str:
     if not docs:
         return ""
 
-    # docs is a raw list of strings
-    ctx = "\n\n".join([f"[{i+1}] {d}" for i, d in enumerate(docs[:4])])
+    # Build numbered context chunks
+    ctx = "\n\n".join(f"[{i+1}] {d}" for i, d in enumerate(docs[:4]))
 
     prompt = f"""
 Use ONLY the numbered CONTEXT below to answer.
@@ -138,12 +151,12 @@ CONTEXT:
     return ans
 
 
-def scholarly_lookup(query: str, max_results=3):
+def scholarly_lookup(query: str, max_results: int = 3) -> List[str]:
     refs = []
     try:
         r = requests.get(
             f"https://api.crossref.org/works?rows={max_results}&query={quote(query)}",
-            timeout=8
+            timeout=8,
         ).json()
 
         for item in r.get("message", {}).get("items", []):
@@ -158,7 +171,7 @@ def scholarly_lookup(query: str, max_results=3):
             refs.append(f"{author_str} ({year}). *{title}*. {link}")
 
         return refs or ["(No scholarly reference found)"]
-    except:
+    except Exception:
         return ["(No scholarly reference found)"]
 
 
@@ -175,16 +188,14 @@ class GraphState(TypedDict):
 
 def db1_node(state: GraphState) -> GraphState:
     q = clean_query(state["query"])
-    results = query_db(db1, q)
-    docs = results["documents"][0] if results["documents"] else []
+    docs = query_db(db1, k=6)
     ans = extractive_answer(q, docs)
     return {**state, "context": "DB1" if ans else "", "answer": ans}
 
 
 def db2_node(state: GraphState) -> GraphState:
     q = clean_query(state["query"])
-    results = query_db(db2, q)
-    docs = results["documents"][0] if results["documents"] else []
+    docs = query_db(db2, k=6)
     ans = extractive_answer(q, docs)
     return {**state, "context": "DB2" if ans else "", "answer": ans}
 
@@ -194,7 +205,7 @@ def google_node(state: GraphState) -> GraphState:
         res = google_tool.invoke({"query": state["query"]})
         ans = ask_gemini(f"Summarize this Google result:\n{res}")
         return {**state, "context": "Google", "answer": ans}
-    except:
+    except Exception:
         return state
 
 
@@ -203,7 +214,7 @@ def wiki_node(state: GraphState) -> GraphState:
         res = wiki_tool.invoke({"query": state["query"]})
         ans = ask_gemini(f"Summarize this Wikipedia text:\n{res}")
         return {**state, "context": "Wikipedia", "answer": ans}
-    except:
+    except Exception:
         return state
 
 
@@ -229,9 +240,21 @@ workflow.add_node("wiki", wiki_node)
 workflow.add_node("final", final_node)
 
 workflow.add_edge(START, "db1")
-workflow.add_conditional_edges("db1", lambda s: bool(s["answer"]), {"true": "final", "false": "db2"})
-workflow.add_conditional_edges("db2", lambda s: bool(s["answer"]), {"true": "final", "false": "google"})
-workflow.add_conditional_edges("google", lambda s: bool(s["answer"]), {"true": "final", "false": "wiki"})
+workflow.add_conditional_edges(
+    "db1",
+    lambda s: bool(s["answer"]),
+    {"true": "final", "false": "db2"},
+)
+workflow.add_conditional_edges(
+    "db2",
+    lambda s: bool(s["answer"]),
+    {"true": "final", "false": "google"},
+)
+workflow.add_conditional_edges(
+    "google",
+    lambda s: bool(s["answer"]),
+    {"true": "final", "false": "wiki"},
+)
 workflow.add_edge("wiki", "final")
 
 graph = workflow.compile()
@@ -241,8 +264,9 @@ graph = workflow.compile()
 # 🎨 STREAMLIT UI
 # ======================================================
 st.set_page_config(page_title="Hybrid RAG Chatbot", page_icon="🤖", layout="wide")
-st.title("🤖 Hybrid RAG + Web Search Chatbot")
+st.title("🤖 Hybrid RAG + Web + References Chatbot")
 
+# Load + normalize chat history
 if "chat" not in st.session_state:
     st.session_state.chat = normalize_chat(load_memory())
 else:
@@ -254,30 +278,34 @@ if st.button("Submit"):
     if user_input.strip():
         mem = st.session_state.chat
 
-        result = graph.invoke({
-            "query": user_input,
-            "answer": "",
-            "context": "",
-            "citations": [],
-            "chat_history": mem,
-        })
+        result = graph.invoke(
+            {
+                "query": user_input,
+                "answer": "",
+                "context": "",
+                "citations": [],
+                "chat_history": mem,
+            }
+        )
 
         st.write("### Response")
         st.write(result["answer"])
         st.write(f"**Source:** `{result['context']}`")
 
+        # Save memory
         mem.append({"query": user_input, "answer": result["answer"]})
         save_memory(mem)
         st.session_state.chat = mem
 
-
-# HISTORY
+# Display history
 st.write("---")
 st.write("### Recent Chat History")
 
 for c in st.session_state.chat[-10:]:
-    st.markdown(f"**You:** {c.get('query','')}")
-    st.markdown(f"**Bot:** {c.get('answer','')}")
+    st.markdown(f"**You:** {c.get('query', '')}")
+    st.markdown(f"**Bot:** {c.get('answer', '')}")
+
+
 
 
 
@@ -323,11 +351,8 @@ for c in st.session_state.chat[-10:]:
 # # LangGraph
 # from langgraph.graph import StateGraph, START, END
 
-# # NEW — use updated Chroma package (not deprecated)
+# # Chroma (new package)
 # from langchain_chroma import Chroma
-
-# # NEW — use SentenceTransformer directly (avoids cache_folder bug)
-# from sentence_transformers import SentenceTransformer
 
 # # Google Search & Wikipedia Tools
 # from langchain_community.utilities import WikipediaAPIWrapper, GoogleSearchAPIWrapper
@@ -348,37 +373,27 @@ for c in st.session_state.chat[-10:]:
 
 
 # # ======================================================
-# # 📁 CHROMA + MANUAL EMBEDDING FUNCTION (Cloud-safe)
+# # 📁 LOAD CHROMA DB (NO EMBEDDING FUNCTION)
 # # ======================================================
 # BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # PERSIST_DIR_1 = os.path.join(BASE_DIR, "chroma_db_nomic")
 # PERSIST_DIR_2 = os.path.join(BASE_DIR, "chroma_db_jsonl")
 
-# # Load SAME embedding model used for original DB creation
-# # This works on Streamlit Cloud (fixes cache_folder + HF bugs)
-# # hf_model = SentenceTransformer("nomic-ai/nomic-embed-text-v1")
-# hf_model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
+# # DO NOT pass embedding_function — we must let Chroma use stored embeddings
+# db1 = Chroma(persist_directory=PERSIST_DIR_1)
+# db2 = Chroma(persist_directory=PERSIST_DIR_2)
 
-
-
-# def embed_text(texts: List[str]):
-#     """Embedding function passed to Chroma."""
-#     return hf_model.encode(texts).tolist()
-
-# # Load vectorstores using manual embedding function
-# db1 = Chroma(
-#     persist_directory=PERSIST_DIR_1,
-#     embedding_function=embed_text
-# )
-
-# db2 = Chroma(
-#     persist_directory=PERSIST_DIR_2,
-#     embedding_function=embed_text
-# )
-
-# retriever1 = db1.as_retriever(search_kwargs={"k": 6})
-# retriever2 = db2.as_retriever(search_kwargs={"k": 6})
+# # direct low-level query (no embedding computation)
+# def query_db(db, query: str, k=6):
+#     """
+#     Query Chroma using stored embeddings (no embedding model needed).
+#     """
+#     return db._collection.query(
+#         query_texts=[query],  # Chroma internally handles fallback + stored vectors
+#         n_results=k,
+#         include=["documents"]
+#     )
 
 
 # # ======================================================
@@ -425,7 +440,7 @@ for c in st.session_state.chat[-10:]:
 
 
 # # ======================================================
-# # 🧰 UTILITY FUNCTIONS
+# # 🔍 UTILITY FUNCTIONS
 # # ======================================================
 # def clean_query(q: str) -> str:
 #     return re.sub(r"[\n\r]+", " ", q.strip())
@@ -439,11 +454,12 @@ for c in st.session_state.chat[-10:]:
 #         return "Gemini API Error."
 
 
-# def extractive_answer(query: str, docs: List[Any]) -> str:
+# def extractive_answer(query: str, docs: List[str]) -> str:
 #     if not docs:
 #         return ""
 
-#     ctx = "\n\n".join(f"[{i+1}] {d.page_content}" for i, d in enumerate(docs[:4]))
+#     # docs is a raw list of strings
+#     ctx = "\n\n".join([f"[{i+1}] {d}" for i, d in enumerate(docs[:4])])
 
 #     prompt = f"""
 # Use ONLY the numbered CONTEXT below to answer.
@@ -501,14 +517,16 @@ for c in st.session_state.chat[-10:]:
 
 # def db1_node(state: GraphState) -> GraphState:
 #     q = clean_query(state["query"])
-#     docs = retriever1.invoke(q)
+#     results = query_db(db1, q)
+#     docs = results["documents"][0] if results["documents"] else []
 #     ans = extractive_answer(q, docs)
 #     return {**state, "context": "DB1" if ans else "", "answer": ans}
 
 
 # def db2_node(state: GraphState) -> GraphState:
 #     q = clean_query(state["query"])
-#     docs = retriever2.invoke(q)
+#     results = query_db(db2, q)
+#     docs = results["documents"][0] if results["documents"] else []
 #     ans = extractive_answer(q, docs)
 #     return {**state, "context": "DB2" if ans else "", "answer": ans}
 
@@ -542,7 +560,7 @@ for c in st.session_state.chat[-10:]:
 
 
 # # ======================================================
-# # 🔧 BUILD WORKFLOW GRAPH
+# # 🔧 BUILD GRAPH
 # # ======================================================
 # workflow = StateGraph(GraphState)
 
@@ -567,7 +585,6 @@ for c in st.session_state.chat[-10:]:
 # st.set_page_config(page_title="Hybrid RAG Chatbot", page_icon="🤖", layout="wide")
 # st.title("🤖 Hybrid RAG + Web Search Chatbot")
 
-# # Load chat history
 # if "chat" not in st.session_state:
 #     st.session_state.chat = normalize_chat(load_memory())
 # else:
@@ -595,21 +612,14 @@ for c in st.session_state.chat[-10:]:
 #         save_memory(mem)
 #         st.session_state.chat = mem
 
-# # Show history
+
+# # HISTORY
 # st.write("---")
 # st.write("### Recent Chat History")
 
 # for c in st.session_state.chat[-10:]:
 #     st.markdown(f"**You:** {c.get('query','')}")
 #     st.markdown(f"**Bot:** {c.get('answer','')}")
-
-
-
-
-
-
-
-
 
 
 
@@ -655,22 +665,22 @@ for c in st.session_state.chat[-10:]:
 # # # LangGraph
 # # from langgraph.graph import StateGraph, START, END
 
-# # # NEW — HuggingFace embeddings compatible with Streamlit Cloud
-# # from langchain_community.embeddings import HuggingFaceEmbeddings
-
-# # # NEW — Updated Chroma import (recommended)
+# # # NEW — use updated Chroma package (not deprecated)
 # # from langchain_chroma import Chroma
+
+# # # NEW — use SentenceTransformer directly (avoids cache_folder bug)
+# # from sentence_transformers import SentenceTransformer
 
 # # # Google Search & Wikipedia Tools
 # # from langchain_community.utilities import WikipediaAPIWrapper, GoogleSearchAPIWrapper
 # # from langchain_community.tools import WikipediaQueryRun, GoogleSearchRun
 
-# # # Google Gemini (for generation)
+# # # Google Gemini API
 # # from google.generativeai import configure, GenerativeModel
 
 
 # # # ======================================================
-# # # 🔐 LOAD API KEYS FROM STREAMLIT SECRETS
+# # # 🔐 STREAMLIT SECRETS — API KEYS
 # # # ======================================================
 # # GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
 # # GOOGLE_CSE_ID = st.secrets["GOOGLE_CSE_ID"]
@@ -680,28 +690,33 @@ for c in st.session_state.chat[-10:]:
 
 
 # # # ======================================================
-# # # 📁 CHROMA + EMBEDDINGS (Cloud-safe)
+# # # 📁 CHROMA + MANUAL EMBEDDING FUNCTION (Cloud-safe)
 # # # ======================================================
 # # BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # # PERSIST_DIR_1 = os.path.join(BASE_DIR, "chroma_db_nomic")
 # # PERSIST_DIR_2 = os.path.join(BASE_DIR, "chroma_db_jsonl")
 
-# # # Load SAME embedding model used to build DB (nomic-embed-text 768D)
-# # embeddings = HuggingFaceEmbeddings(
-# #     model_name="nomic-ai/nomic-embed-text-v1",
-# #     model_kwargs={"device": "cpu"}
-# # )
+# # # Load SAME embedding model used for original DB creation
+# # # This works on Streamlit Cloud (fixes cache_folder + HF bugs)
+# # # hf_model = SentenceTransformer("nomic-ai/nomic-embed-text-v1")
+# # hf_model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
 
-# # # Load vectorstores with embedding function
+
+
+# # def embed_text(texts: List[str]):
+# #     """Embedding function passed to Chroma."""
+# #     return hf_model.encode(texts).tolist()
+
+# # # Load vectorstores using manual embedding function
 # # db1 = Chroma(
 # #     persist_directory=PERSIST_DIR_1,
-# #     embedding_function=embeddings
+# #     embedding_function=embed_text
 # # )
 
 # # db2 = Chroma(
 # #     persist_directory=PERSIST_DIR_2,
-# #     embedding_function=embeddings
+# #     embedding_function=embed_text
 # # )
 
 # # retriever1 = db1.as_retriever(search_kwargs={"k": 6})
@@ -869,7 +884,7 @@ for c in st.session_state.chat[-10:]:
 
 
 # # # ======================================================
-# # # 🔧 BUILD WORKFLOW
+# # # 🔧 BUILD WORKFLOW GRAPH
 # # # ======================================================
 # # workflow = StateGraph(GraphState)
 
@@ -892,9 +907,9 @@ for c in st.session_state.chat[-10:]:
 # # # 🎨 STREAMLIT UI
 # # # ======================================================
 # # st.set_page_config(page_title="Hybrid RAG Chatbot", page_icon="🤖", layout="wide")
-# # st.title("🤖 Hybrid RAG + Google + Wikipedia Chatbot")
+# # st.title("🤖 Hybrid RAG + Web Search Chatbot")
 
-# # # Load + normalize chat history
+# # # Load chat history
 # # if "chat" not in st.session_state:
 # #     st.session_state.chat = normalize_chat(load_memory())
 # # else:
@@ -922,16 +937,22 @@ for c in st.session_state.chat[-10:]:
 # #         save_memory(mem)
 # #         st.session_state.chat = mem
 
-
-# # # Display history
+# # # Show history
 # # st.write("---")
 # # st.write("### Recent Chat History")
 
 # # for c in st.session_state.chat[-10:]:
-# #     query = c.get("query", str(c))
-# #     answer = c.get("answer", "")
-# #     st.markdown(f"**You:** {query}")
-# #     st.markdown(f"**Bot:** {answer}")
+# #     st.markdown(f"**You:** {c.get('query','')}")
+# #     st.markdown(f"**Bot:** {c.get('answer','')}")
+
+
+
+
+
+
+
+
+
 
 
 
@@ -976,14 +997,17 @@ for c in st.session_state.chat[-10:]:
 # # # # LangGraph
 # # # from langgraph.graph import StateGraph, START, END
 
-# # # # Existing Chroma DB (LangChain community wrapper)
-# # # from langchain_community.vectorstores import Chroma
+# # # # NEW — HuggingFace embeddings compatible with Streamlit Cloud
+# # # from langchain_community.embeddings import HuggingFaceEmbeddings
+
+# # # # NEW — Updated Chroma import (recommended)
+# # # from langchain_chroma import Chroma
 
 # # # # Google Search & Wikipedia Tools
 # # # from langchain_community.utilities import WikipediaAPIWrapper, GoogleSearchAPIWrapper
 # # # from langchain_community.tools import WikipediaQueryRun, GoogleSearchRun
 
-# # # # Google Gemini (direct API)
+# # # # Google Gemini (for generation)
 # # # from google.generativeai import configure, GenerativeModel
 
 
@@ -998,16 +1022,29 @@ for c in st.session_state.chat[-10:]:
 
 
 # # # # ======================================================
-# # # # 📁 LOAD EXISTING CHROMA DB (NO EMBEDDINGS NEEDED)
+# # # # 📁 CHROMA + EMBEDDINGS (Cloud-safe)
 # # # # ======================================================
 # # # BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # # # PERSIST_DIR_1 = os.path.join(BASE_DIR, "chroma_db_nomic")
 # # # PERSIST_DIR_2 = os.path.join(BASE_DIR, "chroma_db_jsonl")
 
-# # # # vectorstore already contains embeddings → do NOT pass embedding_function
-# # # db1 = Chroma(persist_directory=PERSIST_DIR_1)
-# # # db2 = Chroma(persist_directory=PERSIST_DIR_2)
+# # # # Load SAME embedding model used to build DB (nomic-embed-text 768D)
+# # # embeddings = HuggingFaceEmbeddings(
+# # #     model_name="nomic-ai/nomic-embed-text-v1",
+# # #     model_kwargs={"device": "cpu"}
+# # # )
+
+# # # # Load vectorstores with embedding function
+# # # db1 = Chroma(
+# # #     persist_directory=PERSIST_DIR_1,
+# # #     embedding_function=embeddings
+# # # )
+
+# # # db2 = Chroma(
+# # #     persist_directory=PERSIST_DIR_2,
+# # #     embedding_function=embeddings
+# # # )
 
 # # # retriever1 = db1.as_retriever(search_kwargs={"k": 6})
 # # # retriever2 = db2.as_retriever(search_kwargs={"k": 6})
@@ -1040,7 +1077,6 @@ for c in st.session_state.chat[-10:]:
 # # #     return []
 
 
-# # # # FIX: Normalize memory to dict format
 # # # def normalize_chat(mem):
 # # #     fixed = []
 # # #     for item in mem:
@@ -1175,7 +1211,7 @@ for c in st.session_state.chat[-10:]:
 
 
 # # # # ======================================================
-# # # # 🔧 BUILD WORKFLOW GRAPH
+# # # # 🔧 BUILD WORKFLOW
 # # # # ======================================================
 # # # workflow = StateGraph(GraphState)
 
@@ -1224,13 +1260,12 @@ for c in st.session_state.chat[-10:]:
 # # #         st.write(result["answer"])
 # # #         st.write(f"**Source:** `{result['context']}`")
 
-# # #         # Save new memory
 # # #         mem.append({"query": user_input, "answer": result["answer"]})
 # # #         save_memory(mem)
 # # #         st.session_state.chat = mem
 
 
-# # # # Display history safely
+# # # # Display history
 # # # st.write("---")
 # # # st.write("### Recent Chat History")
 
@@ -1239,4 +1274,311 @@ for c in st.session_state.chat[-10:]:
 # # #     answer = c.get("answer", "")
 # # #     st.markdown(f"**You:** {query}")
 # # #     st.markdown(f"**Bot:** {answer}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# # # # import streamlit as st
+# # # # import os
+# # # # import json
+# # # # import re
+# # # # import requests
+# # # # from urllib.parse import quote
+# # # # from typing import TypedDict, List, Dict, Any
+
+# # # # # LangGraph
+# # # # from langgraph.graph import StateGraph, START, END
+
+# # # # # Existing Chroma DB (LangChain community wrapper)
+# # # # from langchain_community.vectorstores import Chroma
+
+# # # # # Google Search & Wikipedia Tools
+# # # # from langchain_community.utilities import WikipediaAPIWrapper, GoogleSearchAPIWrapper
+# # # # from langchain_community.tools import WikipediaQueryRun, GoogleSearchRun
+
+# # # # # Google Gemini (direct API)
+# # # # from google.generativeai import configure, GenerativeModel
+
+
+# # # # # ======================================================
+# # # # # 🔐 LOAD API KEYS FROM STREAMLIT SECRETS
+# # # # # ======================================================
+# # # # GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
+# # # # GOOGLE_CSE_ID = st.secrets["GOOGLE_CSE_ID"]
+
+# # # # configure(api_key=GOOGLE_API_KEY)
+# # # # gemini = GenerativeModel("gemini-2.5-flash")
+
+
+# # # # # ======================================================
+# # # # # 📁 LOAD EXISTING CHROMA DB (NO EMBEDDINGS NEEDED)
+# # # # # ======================================================
+# # # # BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# # # # PERSIST_DIR_1 = os.path.join(BASE_DIR, "chroma_db_nomic")
+# # # # PERSIST_DIR_2 = os.path.join(BASE_DIR, "chroma_db_jsonl")
+
+# # # # # vectorstore already contains embeddings → do NOT pass embedding_function
+# # # # db1 = Chroma(persist_directory=PERSIST_DIR_1)
+# # # # db2 = Chroma(persist_directory=PERSIST_DIR_2)
+
+# # # # retriever1 = db1.as_retriever(search_kwargs={"k": 6})
+# # # # retriever2 = db2.as_retriever(search_kwargs={"k": 6})
+
+
+# # # # # ======================================================
+# # # # # 🌐 SEARCH TOOLS
+# # # # # ======================================================
+# # # # wiki_tool = WikipediaQueryRun(api_wrapper=WikipediaAPIWrapper())
+
+# # # # google_tool = GoogleSearchRun(
+# # # #     api_wrapper=GoogleSearchAPIWrapper(
+# # # #         google_api_key=GOOGLE_API_KEY,
+# # # #         google_cse_id=GOOGLE_CSE_ID,
+# # # #     )
+# # # # )
+
+
+# # # # # ======================================================
+# # # # # 💾 CHAT MEMORY
+# # # # # ======================================================
+# # # # MEMORY_FILE = "chat_memory.json"
+
+# # # # def load_memory():
+# # # #     if os.path.exists(MEMORY_FILE):
+# # # #         try:
+# # # #             return json.load(open(MEMORY_FILE, "r", encoding="utf-8"))
+# # # #         except:
+# # # #             return []
+# # # #     return []
+
+
+# # # # # FIX: Normalize memory to dict format
+# # # # def normalize_chat(mem):
+# # # #     fixed = []
+# # # #     for item in mem:
+# # # #         if isinstance(item, dict):
+# # # #             fixed.append(item)
+# # # #         elif isinstance(item, (list, tuple)) and len(item) == 2:
+# # # #             fixed.append({"query": item[0], "answer": item[1]})
+# # # #         else:
+# # # #             continue
+# # # #     return fixed
+
+
+# # # # def save_memory(mem):
+# # # #     json.dump(mem[-15:], open(MEMORY_FILE, "w", encoding="utf-8"), indent=2)
+
+
+# # # # # ======================================================
+# # # # # 🧰 UTILITY FUNCTIONS
+# # # # # ======================================================
+# # # # def clean_query(q: str) -> str:
+# # # #     return re.sub(r"[\n\r]+", " ", q.strip())
+
+
+# # # # def ask_gemini(prompt: str) -> str:
+# # # #     try:
+# # # #         response = gemini.generate_content(prompt)
+# # # #         return response.text
+# # # #     except:
+# # # #         return "Gemini API Error."
+
+
+# # # # def extractive_answer(query: str, docs: List[Any]) -> str:
+# # # #     if not docs:
+# # # #         return ""
+
+# # # #     ctx = "\n\n".join(f"[{i+1}] {d.page_content}" for i, d in enumerate(docs[:4]))
+
+# # # #     prompt = f"""
+# # # # Use ONLY the numbered CONTEXT below to answer.
+
+# # # # Every sentence MUST end with a citation like [1], [2], [3].
+
+# # # # If context is insufficient, return "NOINFO".
+
+# # # # Question: {query}
+
+# # # # CONTEXT:
+# # # # {ctx}
+# # # # """
+
+# # # #     ans = ask_gemini(prompt)
+# # # #     if ans.startswith("NOINFO") or len(ans) < 40:
+# # # #         return ""
+# # # #     return ans
+
+
+# # # # def scholarly_lookup(query: str, max_results=3):
+# # # #     refs = []
+# # # #     try:
+# # # #         r = requests.get(
+# # # #             f"https://api.crossref.org/works?rows={max_results}&query={quote(query)}",
+# # # #             timeout=8
+# # # #         ).json()
+
+# # # #         for item in r.get("message", {}).get("items", []):
+# # # #             title = item.get("title", ["Untitled"])[0]
+# # # #             authors = item.get("author", [])
+# # # #             author_str = ", ".join(a.get("family", "") for a in authors[:2]) or "Unknown"
+# # # #             if len(authors) > 2:
+# # # #                 author_str += " et al."
+# # # #             year = item.get("issued", {}).get("date-parts", [[None]])[0][0]
+# # # #             doi = item.get("DOI", "")
+# # # #             link = f"https://doi.org/{doi}" if doi else item.get("URL", "")
+# # # #             refs.append(f"{author_str} ({year}). *{title}*. {link}")
+
+# # # #         return refs or ["(No scholarly reference found)"]
+# # # #     except:
+# # # #         return ["(No scholarly reference found)"]
+
+
+# # # # # ======================================================
+# # # # # 🔀 GRAPH WORKFLOW NODES
+# # # # # ======================================================
+# # # # class GraphState(TypedDict):
+# # # #     query: str
+# # # #     answer: str
+# # # #     context: str
+# # # #     citations: List[str]
+# # # #     chat_history: List[Dict[str, str]]
+
+
+# # # # def db1_node(state: GraphState) -> GraphState:
+# # # #     q = clean_query(state["query"])
+# # # #     docs = retriever1.invoke(q)
+# # # #     ans = extractive_answer(q, docs)
+# # # #     return {**state, "context": "DB1" if ans else "", "answer": ans}
+
+
+# # # # def db2_node(state: GraphState) -> GraphState:
+# # # #     q = clean_query(state["query"])
+# # # #     docs = retriever2.invoke(q)
+# # # #     ans = extractive_answer(q, docs)
+# # # #     return {**state, "context": "DB2" if ans else "", "answer": ans}
+
+
+# # # # def google_node(state: GraphState) -> GraphState:
+# # # #     try:
+# # # #         res = google_tool.invoke({"query": state["query"]})
+# # # #         ans = ask_gemini(f"Summarize this Google result:\n{res}")
+# # # #         return {**state, "context": "Google", "answer": ans}
+# # # #     except:
+# # # #         return state
+
+
+# # # # def wiki_node(state: GraphState) -> GraphState:
+# # # #     try:
+# # # #         res = wiki_tool.invoke({"query": state["query"]})
+# # # #         ans = ask_gemini(f"Summarize this Wikipedia text:\n{res}")
+# # # #         return {**state, "context": "Wikipedia", "answer": ans}
+# # # #     except:
+# # # #         return state
+
+
+# # # # def final_node(state: GraphState) -> GraphState:
+# # # #     q = clean_query(state["query"])
+# # # #     final_answer = state["answer"] or ask_gemini(q)
+# # # #     refs = scholarly_lookup(q)
+
+# # # #     state["citations"] = refs
+# # # #     state["answer"] = f"{final_answer}\n\n**References:**\n" + "\n".join(refs)
+# # # #     return state
+
+
+# # # # # ======================================================
+# # # # # 🔧 BUILD WORKFLOW GRAPH
+# # # # # ======================================================
+# # # # workflow = StateGraph(GraphState)
+
+# # # # workflow.add_node("db1", db1_node)
+# # # # workflow.add_node("db2", db2_node)
+# # # # workflow.add_node("google", google_node)
+# # # # workflow.add_node("wiki", wiki_node)
+# # # # workflow.add_node("final", final_node)
+
+# # # # workflow.add_edge(START, "db1")
+# # # # workflow.add_conditional_edges("db1", lambda s: bool(s["answer"]), {"true": "final", "false": "db2"})
+# # # # workflow.add_conditional_edges("db2", lambda s: bool(s["answer"]), {"true": "final", "false": "google"})
+# # # # workflow.add_conditional_edges("google", lambda s: bool(s["answer"]), {"true": "final", "false": "wiki"})
+# # # # workflow.add_edge("wiki", "final")
+
+# # # # graph = workflow.compile()
+
+
+# # # # # ======================================================
+# # # # # 🎨 STREAMLIT UI
+# # # # # ======================================================
+# # # # st.set_page_config(page_title="Hybrid RAG Chatbot", page_icon="🤖", layout="wide")
+# # # # st.title("🤖 Hybrid RAG + Google + Wikipedia Chatbot")
+
+# # # # # Load + normalize chat history
+# # # # if "chat" not in st.session_state:
+# # # #     st.session_state.chat = normalize_chat(load_memory())
+# # # # else:
+# # # #     st.session_state.chat = normalize_chat(st.session_state.chat)
+
+# # # # user_input = st.text_input("Ask me anything:")
+
+# # # # if st.button("Submit"):
+# # # #     if user_input.strip():
+# # # #         mem = st.session_state.chat
+
+# # # #         result = graph.invoke({
+# # # #             "query": user_input,
+# # # #             "answer": "",
+# # # #             "context": "",
+# # # #             "citations": [],
+# # # #             "chat_history": mem,
+# # # #         })
+
+# # # #         st.write("### Response")
+# # # #         st.write(result["answer"])
+# # # #         st.write(f"**Source:** `{result['context']}`")
+
+# # # #         # Save new memory
+# # # #         mem.append({"query": user_input, "answer": result["answer"]})
+# # # #         save_memory(mem)
+# # # #         st.session_state.chat = mem
+
+
+# # # # # Display history safely
+# # # # st.write("---")
+# # # # st.write("### Recent Chat History")
+
+# # # # for c in st.session_state.chat[-10:]:
+# # # #     query = c.get("query", str(c))
+# # # #     answer = c.get("answer", "")
+# # # #     st.markdown(f"**You:** {query}")
+# # # #     st.markdown(f"**Bot:** {answer}")
 
