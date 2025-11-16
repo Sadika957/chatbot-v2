@@ -27,7 +27,7 @@ from google.generativeai import configure, GenerativeModel
 # 🔐 STREAMLIT SECRETS — API KEYS
 # ======================================================
 GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
-GOOGLE_CSE_ID = st.secrets["GoogleCustomSearchEngineID"]
+GOOGLE_CSE_ID = st.secrets["GOOGLE_CSE_ID"]
 
 configure(api_key=GOOGLE_API_KEY)
 gemini = GenerativeModel("gemini-2.5-flash")
