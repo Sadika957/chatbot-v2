@@ -16,3 +16,6 @@ requests
 streamlit
 wikipedia
 google-api-python-client>=2.100.0
+langchain-chroma
+huggingface-hub
+sentence-transformers
