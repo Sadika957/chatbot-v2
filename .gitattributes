@@ -1,0 +1,5 @@
+chroma_db_jsonl/** filter=lfs diff=lfs merge=lfs -text
+chroma_db_nomic/** filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.sqlite3 filter=lfs diff=lfs merge=lfs -text
+*.npy filter=lfs diff=lfs merge=lfs -text
