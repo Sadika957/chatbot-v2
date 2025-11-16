@@ -43,7 +43,10 @@ PERSIST_DIR_2 = os.path.join(BASE_DIR, "chroma_db_jsonl")
 
 # Load SAME embedding model used for original DB creation
 # This works on Streamlit Cloud (fixes cache_folder + HF bugs)
-hf_model = SentenceTransformer("nomic-ai/nomic-embed-text-v1")
+# hf_model = SentenceTransformer("nomic-ai/nomic-embed-text-v1")
+hf_model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
+
+
 
 def embed_text(texts: List[str]):
     """Embedding function passed to Chroma."""
