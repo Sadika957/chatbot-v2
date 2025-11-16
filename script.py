@@ -1,3 +1,41 @@
+
+import numpy as np
+import streamlit as st
+from chromadb import PersistentClient
+
+def check_dim_cloud(path):
+    st.write("Checking:", path)
+    try:
+        client = PersistentClient(path=path)
+        col = client.get_default_collection()
+        items = col.get(limit=2)
+        emb = items.get("embeddings")
+        if emb:
+            st.write("DIM:", np.array(emb[0]).shape)
+        else:
+            st.write("No embeddings found.")
+    except Exception as e:
+        st.write("ERROR:", str(e))
+
+if st.sidebar.button("Check DB dimensions"):
+    import os
+    base = os.path.dirname(os.path.abspath(__file__))
+    check_dim_cloud(os.path.join(base, "chroma_db_nomic"))
+    check_dim_cloud(os.path.join(base, "chroma_db_jsonl"))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import streamlit as st
 import os
 import json
