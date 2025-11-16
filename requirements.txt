@@ -1,21 +1,35 @@
-langchain
-langchain-core
-langchain-community
-langchain-google-genai
-google-generativeai
 
-langgraph
-chromadb
-ollama
 
-protobuf
-pydantic
-typing_extensions
 
-requests
-streamlit
-wikipedia
-google-api-python-client>=2.100.0
+# --- Core LangChain ---
+langchain==0.2.14
+langchain-core==0.2.29
+langchain-community==0.2.10
 langchain-chroma
-huggingface-hub
-sentence-transformers
+langchain-google-genai
+
+# --- ChromaDB ---
+chromadb==0.5.11
+
+# --- Embeddings (required for SentenceTransformer) ---
+sentence-transformers==2.6.1
+transformers==4.41.2
+torch==2.2.0
+huggingface-hub==0.23.0
+
+# --- Google ---
+google-generativeai
+google-api-python-client>=2.100.0
+
+# --- LangGraph ---
+langgraph==0.1.20
+
+# --- Web ---
+requests
+wikipedia
+streamlit
+
+# --- Other ---
+protobuf==3.20.3
+pydantic==1.10.12
+typing_extensions
